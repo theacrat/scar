@@ -575,7 +575,7 @@ pub fn clone_asset(dir: &Path, from: &str, to: &str, image: Option<&Path>) -> Re
     Ok(())
 }
 
-enum InstallOutcome {
+pub(crate) enum InstallOutcome {
     Installed,
     SizeMismatch {
         need_w: u32,
@@ -590,7 +590,7 @@ enum InstallOutcome {
 
 /// Overwrite the clone's PNG so `compile` re-encodes from it (Image directly;
 /// RawPayload via its editable preview + hash mismatch).
-fn install_image(
+pub(crate) fn install_image(
     dir: &Path,
     r: &Rendition,
     image: &Path,

@@ -611,7 +611,16 @@ pub fn write_png(path: &std::path::Path, px: &Pixels) -> Result<()> {
 
 pub fn read_png(path: &std::path::Path) -> Result<Pixels> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let decoder = png::Decoder::new(file);
+    decode_png_reader(file)
+}
+
+/// Decode a PNG from raw bytes (straight RGBA8), mirroring [`read_png`].
+pub fn decode_png(bytes: &[u8]) -> Result<Pixels> {
+    decode_png_reader(std::io::Cursor::new(bytes))
+}
+
+fn decode_png_reader(r: impl Read) -> Result<Pixels> {
+    let decoder = png::Decoder::new(r);
     let mut reader = decoder.read_info().context("reading PNG header")?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).context("reading PNG frame")?;

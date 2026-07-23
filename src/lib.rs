@@ -14,6 +14,7 @@ pub mod deepmap;
 pub mod deepmap_encode;
 pub mod format;
 pub mod manifest;
+pub mod merge;
 pub mod rawimg;
 pub mod rle;
 pub mod widegamut;
