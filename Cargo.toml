@@ -1,0 +1,29 @@
+[package]
+name = "scar"
+version = "0.1.0"
+edition = "2024"
+description = "Decompile and compile Apple Assets.car files without Apple tooling"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "scar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+png = "0.17"
+flate2 = "1"
+lzfse_rust = "0.2"
+base64 = "0.22"
+
+# macOS-only, used by the example oracle harnesses to drive Apple's private
+# CoreUI framework (examples/common/cuidump.rs).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = { version = "0.6", features = ["exception"] }
