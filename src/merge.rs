@@ -9,7 +9,7 @@ use std::fs;
 
 use anyhow::{Result, bail};
 
-use crate::authoring::{InstallOutcome, install_image};
+use crate::authoring::{InstallOutcome, LinkPolicy, install_image};
 use crate::manifest::Manifest;
 use crate::{codec, compile, decompile};
 
@@ -57,9 +57,13 @@ pub fn merge_car_report(
 
         let mut landed = false;
         for idx in resolve_renditions(&manifest, name) {
-            if let InstallOutcome::Installed =
-                install_image(&work, &manifest.renditions[idx], &png_path, &px)?
-            {
+            if let InstallOutcome::Installed = install_image(
+                &work,
+                &manifest.renditions[idx],
+                &png_path,
+                &px,
+                LinkPolicy::Paste,
+            )? {
                 replaced += 1;
                 landed = true;
             }
@@ -71,7 +75,13 @@ pub fn merge_car_report(
 
     compile::compile(&work, &out_car)?;
     let bytes = fs::read(&out_car)?;
-    Ok((bytes, MergeReport { replaced, unmatched }))
+    Ok((
+        bytes,
+        MergeReport {
+            replaced,
+            unmatched,
+        },
+    ))
 }
 
 /// Candidate rendition indices for `name`: prefer a facet's `identifier`, else

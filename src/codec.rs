@@ -620,7 +620,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<Pixels> {
 }
 
 fn decode_png_reader(r: impl Read) -> Result<Pixels> {
-    let decoder = png::Decoder::new(r);
+    let mut decoder = png::Decoder::new(r);
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().context("reading PNG header")?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).context("reading PNG frame")?;
@@ -987,6 +988,91 @@ mod tests {
             on_disk,
             "COLR with system name must round-trip byte-exact"
         );
+    }
+
+    fn encode_png(
+        w: u32,
+        h: u32,
+        ct: png::ColorType,
+        depth: png::BitDepth,
+        palette: Option<Vec<u8>>,
+        trns: Option<Vec<u8>>,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(std::io::Cursor::new(&mut out), w, h);
+            enc.set_color(ct);
+            enc.set_depth(depth);
+            if let Some(p) = palette {
+                enc.set_palette(p);
+            }
+            if let Some(t) = trns {
+                enc.set_trns(t);
+            }
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(data).unwrap();
+        }
+        out
+    }
+
+    /// Palette PNGs are ordinary output from most image editors; decoding must
+    /// expand them rather than reject the colour type.
+    #[test]
+    fn decodes_indexed_colour_png() {
+        // Two-entry palette: red, green. Pixels: red, green, green, red.
+        let png = encode_png(
+            2,
+            2,
+            png::ColorType::Indexed,
+            png::BitDepth::Eight,
+            Some(vec![255, 0, 0, 0, 255, 0]),
+            None,
+            &[0, 1, 1, 0],
+        );
+        let px = decode_png(&png).unwrap();
+        assert_eq!((px.width, px.height), (2, 2));
+        assert_eq!(
+            px.rgba,
+            vec![
+                255, 0, 0, 255, // red
+                0, 255, 0, 255, // green
+                0, 255, 0, 255, // green
+                255, 0, 0, 255, // red
+            ]
+        );
+    }
+
+    /// A palette PNG's `tRNS` chunk must become a real alpha channel.
+    #[test]
+    fn decodes_indexed_colour_png_with_transparency() {
+        let png = encode_png(
+            2,
+            1,
+            png::ColorType::Indexed,
+            png::BitDepth::Eight,
+            Some(vec![255, 0, 0, 0, 0, 255]),
+            Some(vec![0]), // palette entry 0 fully transparent
+            &[0, 1],
+        );
+        let px = decode_png(&png).unwrap();
+        assert_eq!(px.rgba, vec![255, 0, 0, 0, 0, 0, 255, 255]);
+    }
+
+    /// 16-bit channels are stripped to 8 rather than rejected.
+    #[test]
+    fn decodes_sixteen_bit_png() {
+        let png = encode_png(
+            1,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Sixteen,
+            None,
+            None,
+            &[0xFF, 0xFF, 0x00, 0x00, 0x80, 0x80, 0xFF, 0xFF],
+        );
+        let px = decode_png(&png).unwrap();
+        assert_eq!(px.rgba, vec![255, 0, 128, 255]);
     }
 
     #[test]

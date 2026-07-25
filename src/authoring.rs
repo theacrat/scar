@@ -525,7 +525,7 @@ pub fn clone_asset(dir: &Path, from: &str, to: &str, image: Option<&Path>) -> Re
         }
 
         if let (Some(img), Some(image)) = (&image_px, image) {
-            match install_image(dir, &r, image, img)? {
+            match install_image(dir, &r, image, img, LinkPolicy::Skip)? {
                 InstallOutcome::Installed => installed += 1,
                 InstallOutcome::SharedAtlas => skipped_links += 1,
                 InstallOutcome::NotABitmap => {}
@@ -575,6 +575,15 @@ pub fn clone_asset(dir: &Path, from: &str, to: &str, image: Option<&Path>) -> Re
     Ok(())
 }
 
+/// Whether a rendition that crops a shared atlas may be painted through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkPolicy {
+    /// Refuse: the atlas is shared with the source asset.
+    Skip,
+    /// Paste the edit back into the atlas at the link's rect.
+    Paste,
+}
+
 pub(crate) enum InstallOutcome {
     Installed,
     SizeMismatch {
@@ -595,6 +604,7 @@ pub(crate) fn install_image(
     r: &Rendition,
     image: &Path,
     img: &codec::Pixels,
+    links: LinkPolicy,
 ) -> Result<InstallOutcome> {
     let overwrite = |rel: &str| -> Result<()> {
         fs::copy(image, dir.join(rel))
@@ -628,6 +638,22 @@ pub(crate) fn install_image(
         }
         Content::RawPayload { kind, .. } if kind.starts_with("celm-") => {
             Ok(InstallOutcome::NotEditable)
+        }
+        Content::Link {
+            rect,
+            preview: Some(p),
+            edit_hash: Some(_),
+            ..
+        } if links == LinkPolicy::Paste => {
+            // The preview is a crop of the atlas, so it must match the rect.
+            if (rect[2], rect[3]) != (img.width, img.height) {
+                return Ok(InstallOutcome::SizeMismatch {
+                    need_w: rect[2],
+                    need_h: rect[3],
+                });
+            }
+            overwrite(p)?;
+            Ok(InstallOutcome::Installed)
         }
         Content::Link { .. } => Ok(InstallOutcome::SharedAtlas),
         _ => Ok(InstallOutcome::NotABitmap),
