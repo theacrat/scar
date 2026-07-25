@@ -67,7 +67,7 @@ struct SourceImage {
 }
 
 /// Keep [A-Za-z0-9._-], replace everything else with '_'.
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {

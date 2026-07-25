@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use scar::codec::{self, Pixels};
 use scar::manifest::{Content, Manifest, Rendition};
-use scar::merge::{merge_car, merge_car_report};
+use scar::merge::{MergeOptions, merge_car, merge_car_report, merge_car_report_with};
 
 const SVG: &str = "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\" fill=\"#123456\"/></svg>";
 
@@ -279,4 +279,188 @@ fn png_replacement_does_not_overwrite_a_data_rendition() {
 
     let (dir, m) = decompiled(&bytes);
     assert_eq!(decoded_data(dir.path(), &m, "glyph.svg").0, SVG.as_bytes());
+}
+
+#[test]
+fn add_missing_adds_a_new_svg_asset() {
+    let car = sample_car();
+    let (base_dir, base_m) = decompiled(&car);
+    let other_before = decoded_asset(base_dir.path(), &base_m, "other");
+
+    let opts = MergeOptions { add_missing: true };
+    let (merged, report) = merge_car_report_with(
+        &car,
+        &[("badge".to_string(), SVG.as_bytes().to_vec())],
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(report.added, vec!["badge".to_string()]);
+    assert_eq!(report.replaced, 0);
+    assert!(report.unmatched.is_empty());
+
+    let (dir, m) = decompiled(&merged);
+    let facet = m
+        .facets
+        .iter()
+        .find(|f| f.name == "badge")
+        .expect("the new facet must exist");
+    let r = m
+        .renditions
+        .iter()
+        .find(|r| r.key.get("identifier") == facet.attributes.get("identifier"))
+        .expect("the facet must resolve to a rendition");
+    assert_eq!(r.name, "badge.svg");
+    assert_eq!(r.layout, 9, "vector renditions use layout 9");
+    assert_eq!(r.pixel_format, "SVG");
+
+    let (data, lzfse) = decoded_data(dir.path(), &m, "badge.svg");
+    assert_eq!(data, SVG.as_bytes(), "payload must be the added SVG");
+    assert!(lzfse, "SVG payloads are LZFSE-wrapped, as in real catalogs");
+
+    assert_eq!(
+        decoded_asset(dir.path(), &m, "other"),
+        other_before,
+        "the untouched asset's pixels must be identical"
+    );
+    assert_eq!(decoded_asset(dir.path(), &m, "logo").len(), 24 * 24 * 4);
+}
+
+#[test]
+fn add_missing_adds_a_new_pdf_asset() {
+    let car = sample_car();
+    let pdf = b"%PDF-1.4\n% added\n%%EOF\n".to_vec();
+
+    let opts = MergeOptions { add_missing: true };
+    let (merged, report) =
+        merge_car_report_with(&car, &[("chart".to_string(), pdf.clone())], &opts).unwrap();
+    assert_eq!(report.added, vec!["chart".to_string()]);
+    assert_eq!(report.replaced, 0);
+    assert!(report.unmatched.is_empty());
+
+    let (dir, m) = decompiled(&merged);
+    assert!(m.facets.iter().any(|f| f.name == "chart"));
+    let r = m.renditions.iter().find(|r| r.name == "chart.pdf").unwrap();
+    assert_eq!(r.layout, 9);
+    assert_eq!(r.pixel_format, "PDF");
+
+    let (data, lzfse) = decoded_data(dir.path(), &m, "chart.pdf");
+    assert_eq!(data, pdf);
+    assert!(!lzfse, "PDF payloads are stored raw, as in real catalogs");
+}
+
+#[test]
+fn without_add_missing_a_new_svg_is_still_unmatched() {
+    let car = sample_car();
+    let repl = [("badge".to_string(), SVG.as_bytes().to_vec())];
+
+    for (bytes, report) in [
+        merge_car_report(&car, &repl).unwrap(),
+        merge_car_report_with(&car, &repl, &MergeOptions::default()).unwrap(),
+    ] {
+        assert_eq!(report.replaced, 0);
+        assert!(report.added.is_empty());
+        assert_eq!(report.unmatched, vec!["badge".to_string()]);
+        let (_dir, m) = decompiled(&bytes);
+        assert!(m.facets.iter().all(|f| f.name != "badge"));
+    }
+}
+
+#[test]
+fn add_missing_will_not_graft_a_vector_onto_a_bitmap_name() {
+    let car = sample_car();
+    let (_base_dir, base_m) = decompiled(&car);
+
+    let opts = MergeOptions { add_missing: true };
+    let (merged, report) = merge_car_report_with(
+        &car,
+        &[("logo".to_string(), SVG.as_bytes().to_vec())],
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(report.replaced, 0);
+    assert!(report.added.is_empty());
+    assert_eq!(report.unmatched, vec!["logo".to_string()]);
+
+    let (_dir, m) = decompiled(&merged);
+    assert_eq!(m.facets.len(), base_m.facets.len());
+    assert_eq!(m.renditions.len(), base_m.renditions.len());
+}
+
+#[test]
+fn add_missing_ignores_bytes_that_are_neither_svg_nor_pdf() {
+    let car = sample_car();
+    let (_base_dir, base_m) = decompiled(&car);
+
+    let opts = MergeOptions { add_missing: true };
+    let (merged, report) = merge_car_report_with(
+        &car,
+        &[("blob".to_string(), b"\x00\x01\x02not a vector".to_vec())],
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(report.replaced, 0);
+    assert!(report.added.is_empty());
+    assert_eq!(report.unmatched, vec!["blob".to_string()]);
+
+    let (_dir, m) = decompiled(&merged);
+    assert_eq!(m.facets.len(), base_m.facets.len());
+    assert_eq!(m.renditions.len(), base_m.renditions.len());
+}
+
+#[test]
+fn an_added_asset_can_be_replaced_again() {
+    let car = sample_car();
+    let opts = MergeOptions { add_missing: true };
+    let (added, report) = merge_car_report_with(
+        &car,
+        &[("badge".to_string(), SVG.as_bytes().to_vec())],
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(report.added, vec!["badge".to_string()]);
+
+    let new_svg = SVG.replace("#123456", "#654321").into_bytes();
+    let (merged, report) =
+        merge_car_report(&added, &[("badge".to_string(), new_svg.clone())]).unwrap();
+    assert_eq!(report.replaced, 1);
+    assert!(report.unmatched.is_empty());
+    assert!(report.added.is_empty());
+
+    let (dir, m) = decompiled(&merged);
+    let (data, lzfse) = decoded_data(dir.path(), &m, "badge.svg");
+    assert_eq!(data, new_svg);
+    assert!(lzfse, "the added rendition keeps its LZFSE wrapping");
+}
+
+/// A car whose key format cannot express `element` must not gain an
+/// unencodable key: the add is skipped and the name stays unmatched.
+#[test]
+fn add_missing_skips_a_car_whose_key_format_lacks_element() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("in");
+    let packed = tmp.path().join("packed");
+    let car_path = tmp.path().join("out.car");
+    std::fs::create_dir_all(&input).unwrap();
+    codec::write_png(&input.join("logo.png"), &solid(24, 24, [10, 120, 240, 255])).unwrap();
+    scar::authoring::pack(&input, &packed, &scar::authoring::PackOptions::default()).unwrap();
+
+    let manifest_path = packed.join("manifest.json");
+    let mut m = Manifest::load(&manifest_path).unwrap();
+    m.car.key_format.retain(|k| k != "element");
+    m.save(&manifest_path).unwrap();
+    scar::compile::compile(&packed, &car_path).unwrap();
+    let car = std::fs::read(&car_path).unwrap();
+
+    let opts = MergeOptions { add_missing: true };
+    let (merged, report) = merge_car_report_with(
+        &car,
+        &[("badge".to_string(), SVG.as_bytes().to_vec())],
+        &opts,
+    )
+    .unwrap();
+    assert!(report.added.is_empty());
+    assert_eq!(report.unmatched, vec!["badge".to_string()]);
+
+    let (_dir, out) = decompiled(&merged);
+    assert!(out.facets.iter().all(|f| f.name != "badge"));
 }
