@@ -91,6 +91,74 @@ fn car_with_data(csi_name: &str, data: &[u8], lzfse: bool) -> Vec<u8> {
     std::fs::read(&car).unwrap()
 }
 
+/// The name merge resolution would use to reach rendition `idx`, if any:
+/// its facet's name, else its CSI name (stem) when no facet shadows it.
+fn merge_name_for(m: &Manifest, idx: usize) -> Option<String> {
+    let r = &m.renditions[idx];
+    if let Some(ident) = r.key.get("identifier")
+        && let Some(f) = m
+            .facets
+            .iter()
+            .find(|f| f.attributes.get("identifier") == Some(ident))
+    {
+        return Some(f.name.clone());
+    }
+    let stem = r.name.strip_suffix(".png").unwrap_or(&r.name);
+    (!m.facets.iter().any(|f| f.name == stem)).then(|| stem.to_string())
+}
+
+/// PNG replacements into atlas links or verbatim payloads rely on previews,
+/// which the merge decompile skips up front; it must notice and re-decode.
+/// Runs against the first shipping catalog with such a rendition; skips if none.
+#[test]
+fn png_into_preview_backed_rendition_survives_the_previewless_decompile() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/re_catalogs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no tests/re_catalogs, skipping");
+        return;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        let car = std::fs::read(entry.path()).unwrap();
+        let (_tmp, m) = decompiled(&car);
+        let candidate = m.renditions.iter().enumerate().find_map(|(idx, r)| {
+            let (w, h) = match &r.content {
+                Content::Link {
+                    rect,
+                    preview: Some(_),
+                    edit_hash: Some(_),
+                    ..
+                } => (rect[2], rect[3]),
+                Content::RawPayload {
+                    preview: Some(_),
+                    edit_hash: Some(_),
+                    ..
+                } => (r.width, r.height),
+                _ => return None,
+            };
+            if w == 0 || h == 0 {
+                return None;
+            }
+            Some((merge_name_for(&m, idx)?, w, h))
+        });
+        let Some((name, w, h)) = candidate else {
+            continue;
+        };
+        let png = png_bytes(&solid(w, h, [200, 40, 40, 255]));
+        let (_, report) = merge_car_report(&car, &[(name.clone(), png)]).unwrap();
+        assert!(
+            report.replaced >= 1,
+            "PNG for {name:?} ({w}x{h}) must land in {:?}",
+            entry.path()
+        );
+        return;
+    }
+    eprintln!("no catalog with an editable link/raw-payload preview, skipping");
+}
+
 /// Decompile `.car` bytes to a fresh dir and hand back (dir, manifest).
 fn decompiled(car: &[u8]) -> (tempfile::TempDir, Manifest) {
     let tmp = tempfile::TempDir::new().unwrap();
