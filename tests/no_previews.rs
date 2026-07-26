@@ -15,6 +15,7 @@ fn no_previews(car: &Path, out: &Path) {
         &DecompileOptions {
             raw: false,
             skip_previews: true,
+            ..Default::default()
         },
     )
     .unwrap();

@@ -248,6 +248,115 @@ fn installable(m: &Manifest, name: &str) -> usize {
         .count()
 }
 
+/// The bytes a rendition's content lives in, whatever kind it is.
+fn content_bytes(dir: &std::path::Path, r: &Rendition) -> Option<Vec<u8>> {
+    let file = match &r.content {
+        Content::Image { file, .. }
+        | Content::Data { file, .. }
+        | Content::RawPayload { file, .. } => file,
+        Content::Link { preview, .. } => preview.as_ref()?,
+        _ => return None,
+    };
+    std::fs::read(dir.join(file)).ok()
+}
+
+/// A merge decodes only what its replacements reach, so everything else must
+/// come out the far side exactly as it went in.
+#[test]
+fn a_merge_leaves_untouched_assets_intact() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/re_catalogs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no tests/re_catalogs, skipping");
+        return;
+    };
+    let mut checked = 0;
+    for entry in entries {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        let car = std::fs::read(entry.path()).unwrap();
+        let (before_tmp, before) = decompiled(&car);
+        let names: Vec<String> = before.facets.iter().map(|f| f.name.clone()).collect();
+        let sizes = replacement_sizes(&car, &names).unwrap();
+        let Some((name, wh)) = sizes
+            .iter()
+            .filter(|(n, _)| installable(&before, n) > 0)
+            .max_by_key(|(_, v)| v.len())
+        else {
+            continue;
+        };
+
+        let repl: Vec<(String, Vec<u8>)> = wh
+            .iter()
+            .map(|(w, h)| (name.clone(), png_bytes(&solid(*w, *h, [17, 240, 99, 255]))))
+            .collect();
+        let (merged, report) = merge_car_report(&car, &repl).unwrap();
+        assert!(report.replaced > 0, "the replacement must land");
+        let (after_tmp, after) = decompiled(&merged);
+
+        // The replaced asset's own renditions are meant to change, and so is any
+        // atlas one of them crops — a pasted-through link rewrites its atlas.
+        let touched = before
+            .facets
+            .iter()
+            .find(|f| &f.name == name)
+            .and_then(|f| f.attributes.get("identifier").copied());
+        let mut expected: Vec<&BTreeMap<String, u16>> = Vec::new();
+        for r in &before.renditions {
+            if touched.is_none() || r.key.get("identifier").copied() != touched {
+                continue;
+            }
+            expected.push(&r.key);
+            if let Content::Link { target, .. } = &r.content {
+                let want: BTreeMap<String, u16> = target
+                    .iter()
+                    .filter(|(_, v)| **v != 0)
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                if let Some(atlas) = before.renditions.iter().find(|a| a.key == want) {
+                    expected.push(&atlas.key);
+                }
+            }
+        }
+        let (before_dir, after_dir) = (
+            before_tmp.path().join("work"),
+            after_tmp.path().join("work"),
+        );
+        let mut compared = 0;
+        for b in &before.renditions {
+            if expected.contains(&&b.key) {
+                continue;
+            }
+            let Some(a) = after
+                .renditions
+                .iter()
+                .find(|a| a.key == b.key && a.name == b.name)
+            else {
+                panic!("rendition {:?} vanished from {:?}", b.name, entry.path());
+            };
+            if let (Some(x), Some(y)) =
+                (content_bytes(&before_dir, b), content_bytes(&after_dir, a))
+            {
+                assert_eq!(
+                    x,
+                    y,
+                    "untouched rendition {:?} changed in {:?}",
+                    b.name,
+                    entry.path()
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "nothing was compared for {:?}", entry.path());
+        checked += 1;
+        if checked == 3 {
+            break;
+        }
+    }
+    assert!(checked > 0, "no catalog exercised a selective merge");
+}
+
 /// Offering a PNG at every reported size must reach every rendition that can
 /// take one, so sizing is never what stands between a replacement and the car.
 #[test]

@@ -11,7 +11,7 @@
 //! With [`MergeOptions::add_missing`], an SVG or PDF whose name matches nothing
 //! at all is instead *added* as a new vector asset (facet + data rendition).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use anyhow::{Context, Result, bail};
@@ -84,6 +84,112 @@ impl Vector {
     }
 }
 
+/// Rendition lookup straight off a car's BOM: enough to resolve replacement
+/// names to renditions, and to size them, without decoding a single payload.
+struct CarIndex {
+    csis: Vec<Csi>,
+    /// Per rendition: its `identifier` key attribute, when non-zero.
+    idents: Vec<Option<u16>>,
+    /// Per rendition: its full key in keyformat order, for resolving links.
+    keys: Vec<Vec<u16>>,
+    key_ids: Vec<u32>,
+    /// identifier -> facet name.
+    facets: BTreeMap<u16, String>,
+}
+
+impl CarIndex {
+    fn parse(car: &[u8]) -> Result<Self> {
+        let bom = Bom::parse(car).context("parsing BOM container")?;
+        let key_ids = decompile::parse_keyformat(
+            bom.var_block("KEYFORMAT")
+                .context("missing KEYFORMAT var")?,
+        )?;
+
+        let mut facets = BTreeMap::new();
+        for (key, value) in bom.tree_entries("FACETKEYS").unwrap_or_default() {
+            let name = String::from_utf8_lossy(&key).into_owned();
+            let Ok(facet) = decompile::parse_facet_value(&name, &value) else {
+                continue;
+            };
+            if let Some(ident) = facet.attributes.get("identifier") {
+                facets.insert(*ident, facet.name);
+            }
+        }
+
+        let entries = bom
+            .tree_entries("RENDITIONS")
+            .context("walking RENDITIONS tree")?;
+        let mut csis = Vec::with_capacity(entries.len());
+        let mut idents = Vec::with_capacity(entries.len());
+        let mut keys = Vec::with_capacity(entries.len());
+        for (key_bytes, value) in &entries {
+            let values = decompile::decode_key_vec(key_bytes, key_ids.len()).unwrap_or_default();
+            idents.push(
+                decompile::key_vec_to_map(&key_ids, &values)
+                    .get("identifier")
+                    .copied(),
+            );
+            keys.push(values);
+            csis.push(Csi::parse(value).context("parsing CSI blob")?);
+        }
+        Ok(Self {
+            csis,
+            idents,
+            keys,
+            key_ids,
+            facets,
+        })
+    }
+
+    /// [`resolve_renditions`]' order, over the car rather than the manifest: a
+    /// facet's identifier, else renditions whose CSI name matches.
+    fn renditions_for(&self, name: &str) -> Vec<usize> {
+        if let Some((ident, _)) = self.facets.iter().find(|(_, n)| n.as_str() == name) {
+            let idxs: Vec<usize> = (0..self.csis.len())
+                .filter(|&i| self.idents[i] == Some(*ident))
+                .collect();
+            if !idxs.is_empty() {
+                return idxs;
+            }
+        }
+        self.by_csi_name(name)
+    }
+
+    /// Renditions called `name`, bare or with an extension.
+    fn by_csi_name(&self, name: &str) -> Vec<usize> {
+        (0..self.csis.len())
+            .filter(|&i| {
+                let n = self.csis[i].header.name_str();
+                n == name || n.rsplit_once('.').is_some_and(|(stem, _)| stem == name)
+            })
+            .collect()
+    }
+
+    /// The packed atlas a link crops, which must be decoded to paste into it.
+    fn link_target(&self, idx: usize) -> Option<usize> {
+        let link = codec::inlk_decode(self.csis[idx].tlv(format::tlv::INTERNAL_LINK)?).ok()?;
+        let mut want = vec![0u16; self.key_ids.len()];
+        for (attr, val) in link.key_pairs.iter().take_while(|(a, _)| *a != 0) {
+            if let Some(pos) = self.key_ids.iter().position(|id| *id == u32::from(*attr)) {
+                want[pos] = *val;
+            }
+        }
+        self.keys.iter().position(|k| *k == want)
+    }
+
+    /// The size a replacement PNG must have, or `None` if this is not a bitmap.
+    fn size_of(&self, idx: usize) -> Option<(u32, u32)> {
+        let csi = &self.csis[idx];
+        // A link's replacement must match its crop, not the atlas behind it.
+        let size = match csi.tlv(format::tlv::INTERNAL_LINK) {
+            Some(t) => codec::inlk_decode(t).ok().map(|l| (l.width, l.height)),
+            None if csi.header.layout == format::layout::MULTISIZE_SET => None,
+            None => Some((csi.header.width, csi.header.height)),
+        };
+        size.filter(|(w, h)| *w > 0 && *h > 0)
+    }
+}
+
 /// The distinct pixel sizes a PNG replacement for each of `names` must be
 /// offered at to reach every bitmap rendition behind it — links report their
 /// crop rect, everything else its own dimensions. Names with no bitmap
@@ -101,80 +207,22 @@ pub fn replacement_sizes(
     car: &[u8],
     names: &[String],
 ) -> Result<BTreeMap<String, Vec<(u32, u32)>>> {
-    let bom = Bom::parse(car).context("parsing BOM container")?;
-    let key_ids = decompile::parse_keyformat(
-        bom.var_block("KEYFORMAT")
-            .context("missing KEYFORMAT var")?,
-    )?;
-    let renditions = bom
-        .tree_entries("RENDITIONS")
-        .context("walking RENDITIONS tree")?;
-
-    // identifier -> facet name, so a rendition can be traced back to its asset.
-    let mut by_identifier: BTreeMap<u16, String> = BTreeMap::new();
-    for (key, value) in bom.tree_entries("FACETKEYS").unwrap_or_default() {
-        let name = String::from_utf8_lossy(&key).into_owned();
-        let Ok(facet) = decompile::parse_facet_value(&name, &value) else {
-            continue;
-        };
-        if let Some(ident) = facet.attributes.get("identifier") {
-            by_identifier.insert(*ident, facet.name);
-        }
-    }
-
-    let wanted: BTreeMap<&str, ()> = names.iter().map(|n| (n.as_str(), ())).collect();
-    let mut parsed = Vec::with_capacity(renditions.len());
-    for (key_bytes, value) in &renditions {
-        let csi = Csi::parse(value).context("parsing CSI blob")?;
-        let values = decompile::decode_key_vec(key_bytes, key_ids.len()).unwrap_or_default();
-        let ident = decompile::key_vec_to_map(&key_ids, &values)
-            .get("identifier")
-            .copied();
-        parsed.push((csi, ident));
-    }
-
-    // resolve_renditions prefers a facet's identifier and only falls back to CSI
-    // names when that yields nothing, so resolve by facet across the whole
-    // catalogue first.
+    let index = CarIndex::parse(car)?;
     let mut out: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
-    for (csi, ident) in &parsed {
-        let Some(name) = ident
-            .and_then(|i| by_identifier.get(&i))
-            .filter(|n| wanted.contains_key(n.as_str()))
-        else {
-            continue;
-        };
-        push_size(&mut out, name, csi);
-    }
-    for (csi, _) in &parsed {
-        let csi_name = csi.header.name_str();
-        let stem = csi_name
-            .rsplit_once('.')
-            .map_or(csi_name.as_str(), |(s, _)| s);
-        for candidate in [csi_name.as_str(), stem] {
-            if wanted.contains_key(candidate) && !out.contains_key(candidate) {
-                push_size(&mut out, candidate, csi);
+    for name in names {
+        let mut sizes: Vec<(u32, u32)> = Vec::new();
+        for idx in index.renditions_for(name) {
+            if let Some(size) = index.size_of(idx)
+                && !sizes.contains(&size)
+            {
+                sizes.push(size);
             }
+        }
+        if !sizes.is_empty() {
+            out.insert(name.clone(), sizes);
         }
     }
     Ok(out)
-}
-
-/// Record the size a PNG must have to replace `csi`, if it is a bitmap at all.
-fn push_size(out: &mut BTreeMap<String, Vec<(u32, u32)>>, name: &str, csi: &Csi) {
-    // A link's replacement must match its crop, not the atlas it points into.
-    let size = match csi.tlv(format::tlv::INTERNAL_LINK) {
-        Some(t) => codec::inlk_decode(t).ok().map(|l| (l.width, l.height)),
-        None if csi.header.layout == format::layout::MULTISIZE_SET => None,
-        None => Some((csi.header.width, csi.header.height)),
-    };
-    let Some(size) = size.filter(|(w, h)| *w > 0 && *h > 0) else {
-        return;
-    };
-    let sizes = out.entry(name.to_string()).or_default();
-    if !sizes.contains(&size) {
-        sizes.push(size);
-    }
 }
 
 /// Rebuild `car` with the given `(asset-name, bytes)` replacements swapped in:
@@ -213,13 +261,32 @@ pub fn merge_car_report_with(
     let out_car = tmp.path().join("out.car");
     fs::write(&in_car, car)?;
 
-    // Previews exist only so PNGs can be pasted into atlas or deepmap2/rle
-    // renditions; skip decoding them when no replacement is a PNG.
+    // Decoding a whole catalog to rewrite a handful of renditions dominates the
+    // merge, so decode only what the replacements can reach; the rest round-trips
+    // verbatim. Previews exist only so PNGs can be pasted into atlas or
+    // deepmap2/rle renditions, so they go too when no replacement is a PNG.
+    let index = CarIndex::parse(car)?;
+    let mut decode_only = BTreeSet::new();
+    for (name, _) in replacements {
+        // The union of both resolution orders, not resolve_renditions' either/or:
+        // decoding a rendition the install pass turns out not to want costs a
+        // little time, missing one it does want would drop the replacement.
+        let mut idxs = index.renditions_for(name);
+        idxs.extend(index.by_csi_name(name));
+        for idx in idxs {
+            decode_only.insert(idx);
+            // Pasting into an atlas needs the atlas itself, not just the crop.
+            if let Some(atlas) = index.link_target(idx) {
+                decode_only.insert(atlas);
+            }
+        }
+    }
     decompile::decompile_with(
         &in_car,
         &work,
         &decompile::DecompileOptions {
             skip_previews: !replacements.iter().any(|(_, b)| b.starts_with(PNG_MAGIC)),
+            decode_only: Some(decode_only),
             ..Default::default()
         },
     )?;

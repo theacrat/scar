@@ -1,7 +1,7 @@
 //! `scar info` and `scar decompile`: read a .car, decode renditions, write
 //! manifest.json + asset files. See docs/FORMAT.md for the byte layouts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -536,6 +536,10 @@ pub struct DecompileOptions {
     /// Skip all preview PNGs (atlas-link crops, deepmap2/rle/wide-gamut previews).
     /// Faster; the affected assets round-trip verbatim but their previews cannot be edited.
     pub skip_previews: bool,
+    /// Decode only these renditions (indices in catalog order); the rest are
+    /// stored verbatim as under `raw`. `None` decodes everything. Lets a caller
+    /// that already knows which assets it will touch skip the bulk of the work.
+    pub decode_only: Option<BTreeSet<usize>>,
 }
 
 pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
@@ -550,7 +554,12 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
 }
 
 pub fn decompile_with(car: &Path, out: &Path, opts: &DecompileOptions) -> Result<()> {
-    let DecompileOptions { raw, skip_previews } = *opts;
+    let DecompileOptions {
+        raw,
+        skip_previews,
+        decode_only,
+    } = opts;
+    let (raw, skip_previews) = (*raw, *skip_previews);
     let data = fs::read(car).with_context(|| format!("reading {}", car.display()))?;
     let bom = Bom::parse(&data).context("parsing BOM container")?;
 
@@ -645,6 +654,7 @@ pub fn decompile_with(car: &Path, out: &Path, opts: &DecompileOptions) -> Result
     let mut atlas_cache: HashMap<usize, Option<Rc<Pixels>>> = HashMap::new();
 
     for (i, csi) in csis.iter().enumerate() {
+        let raw = raw || decode_only.as_ref().is_some_and(|only| !only.contains(&i));
         let name = csi.header.name_str();
         let width = csi.header.width;
         let height = csi.header.height;

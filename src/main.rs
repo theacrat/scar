@@ -92,6 +92,7 @@ fn main() -> anyhow::Result<()> {
             &scar::decompile::DecompileOptions {
                 raw,
                 skip_previews: no_previews,
+                ..Default::default()
             },
         ),
         Command::Compile { dir, out } => scar::compile::compile(&dir, &out),
