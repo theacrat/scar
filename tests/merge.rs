@@ -108,7 +108,7 @@ fn merge_name_for(m: &Manifest, idx: usize) -> Option<String> {
 }
 
 /// PNG replacements into atlas links or verbatim payloads rely on previews,
-/// which the merge decompile skips up front; it must notice and re-decode.
+/// so the merge decompile must not skip them when a PNG is present.
 /// Runs against the first shipping catalog with such a rendition; skips if none.
 #[test]
 fn png_into_preview_backed_rendition_survives_the_previewless_decompile() {

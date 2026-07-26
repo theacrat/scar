@@ -118,34 +118,18 @@ pub fn merge_car_report_with(
     let out_car = tmp.path().join("out.car");
     fs::write(&in_car, car)?;
 
-    // Previews are only needed to paste PNGs into atlas or deepmap2/rle
-    // renditions, and decoding them dominates decompile time; start without
-    // them and redo the decode only if a PNG replacement lands on one.
+    // Previews exist only so PNGs can be pasted into atlas or deepmap2/rle
+    // renditions; skip decoding them when no replacement is a PNG.
     decompile::decompile_with(
         &in_car,
         &work,
         &decompile::DecompileOptions {
-            skip_previews: true,
+            skip_previews: !replacements.iter().any(|(_, b)| b.starts_with(PNG_MAGIC)),
             ..Default::default()
         },
     )?;
     let manifest_path = work.join(crate::manifest::MANIFEST_NAME);
     let mut manifest = Manifest::load(&manifest_path)?;
-
-    let needs_previews = replacements.iter().any(|(name, bytes)| {
-        bytes.starts_with(PNG_MAGIC)
-            && resolve_renditions(&manifest, name).into_iter().any(|idx| {
-                matches!(
-                    manifest.renditions[idx].content,
-                    Content::Link { .. } | Content::RawPayload { .. }
-                )
-            })
-    });
-    if needs_previews {
-        fs::remove_dir_all(&work)?;
-        decompile::decompile(&in_car, &work, false)?;
-        manifest = Manifest::load(&manifest_path)?;
-    }
 
     let mut replaced = 0usize;
     let mut unmatched = Vec::new();
