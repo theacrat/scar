@@ -51,7 +51,10 @@ scar info Assets.car --renditions # list every individual asset
 ```sh
 scar decompile Assets.car --out extracted/
 scar decompile Assets.car --out extracted/ --raw   # no decoding, raw payloads only
+scar decompile Assets.car --out extracted/ --no-previews  # faster; skips editable previews
 ```
+
+`--no-previews` skips the preview PNGs (packed-atlas crops, deepmap2/rle previews), which is the only expensive decoding for assets that otherwise round-trip verbatim; the output is still fully repackable with plain `scar compile`, those previews just can't be edited.
 
 Produces:
 

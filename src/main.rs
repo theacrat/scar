@@ -33,6 +33,10 @@ enum Command {
         /// Store every payload verbatim (byte-exact round-trip, no decoding)
         #[arg(long)]
         raw: bool,
+        /// Skip preview PNGs (atlas crops, deepmap2/rle previews); faster, and the
+        /// output still repacks with plain `compile`. Previews can't be edited.
+        #[arg(long, conflicts_with = "raw")]
+        no_previews: bool,
     },
     /// Build a .car from a decompiled directory (manifest.json + assets).
     Compile {
@@ -77,7 +81,19 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Info { car, renditions } => scar::decompile::info(&car, renditions),
-        Command::Decompile { car, out, raw } => scar::decompile::decompile(&car, &out, raw),
+        Command::Decompile {
+            car,
+            out,
+            raw,
+            no_previews,
+        } => scar::decompile::decompile_with(
+            &car,
+            &out,
+            &scar::decompile::DecompileOptions {
+                raw,
+                skip_previews: no_previews,
+            },
+        ),
         Command::Compile { dir, out } => scar::compile::compile(&dir, &out),
         Command::Pack {
             input,

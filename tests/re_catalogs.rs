@@ -22,14 +22,10 @@ fn re_catalogs_round_trip_byte_identical() {
     }
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).unwrap() {
-        let car = entry.unwrap().path();
-        if car.extension().and_then(|e| e.to_str()) != Some("car")
-            && !car
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains("Assets")
-        {
+        // Every regular file in the directory is a catalog (some names are truncated).
+        let entry = entry.unwrap();
+        let car = entry.path();
+        if !entry.file_type().unwrap().is_file() {
             continue;
         }
         let tag = format!("{checked}");

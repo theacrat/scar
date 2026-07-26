@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -528,7 +529,28 @@ struct Stats {
     dmp2_previews_ok: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DecompileOptions {
+    /// Store every payload verbatim (no decoding).
+    pub raw: bool,
+    /// Skip all preview PNGs (atlas-link crops, deepmap2/rle/wide-gamut previews).
+    /// Faster; the affected assets round-trip verbatim but their previews cannot be edited.
+    pub skip_previews: bool,
+}
+
 pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
+    decompile_with(
+        car,
+        out,
+        &DecompileOptions {
+            raw,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn decompile_with(car: &Path, out: &Path, opts: &DecompileOptions) -> Result<()> {
+    let DecompileOptions { raw, skip_previews } = *opts;
     let data = fs::read(car).with_context(|| format!("reading {}", car.display()))?;
     let bom = Bom::parse(&data).context("parsing BOM container")?;
 
@@ -620,6 +642,7 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
 
     let mut stats = Stats::default();
     let mut out_renditions: Vec<Rendition> = Vec::with_capacity(csis.len());
+    let mut atlas_cache: HashMap<usize, Option<Rc<Pixels>>> = HashMap::new();
 
     for (i, csi) in csis.iter().enumerate() {
         let name = csi.header.name_str();
@@ -719,21 +742,29 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
             }
             // edit_hash lets compile detect an edited preview and paste it back into the atlas.
             let mut edit_hash = None;
-            let preview = key_index.get(&target_full).and_then(|&target_idx| {
-                let atlas = &csis[target_idx];
-                let px = decode_atlas_bitmap(atlas)?;
-                // INLK rect y is bottom-up (docs/FORMAT.md §6.4); flip here, manifest keeps the stored rect.
-                let y_top = px.height.checked_sub(link.y)?.checked_sub(link.height)?;
-                let cropped = crop_rect(&px, link.x, y_top, link.width, link.height)?;
-                let file = rel_path("previews", i, &name, "png");
-                codec::write_png(&out.join(&file), &cropped).ok()?;
-                if let Ok(bytes) = fs::read(out.join(&file)) {
-                    edit_hash = Some(hash_bytes(&bytes));
+            let mut preview = None;
+            if !skip_previews {
+                if let Some(&target_idx) = key_index.get(&target_full) {
+                    // Many links share one atlas; decode each at most once.
+                    let atlas = atlas_cache
+                        .entry(target_idx)
+                        .or_insert_with(|| decode_atlas_bitmap(&csis[target_idx]).map(Rc::new))
+                        .clone();
+                    preview = atlas.and_then(|px| {
+                        // INLK rect y is bottom-up (docs/FORMAT.md §6.4); flip here, manifest keeps the stored rect.
+                        let y_top = px.height.checked_sub(link.y)?.checked_sub(link.height)?;
+                        let cropped = crop_rect(&px, link.x, y_top, link.width, link.height)?;
+                        let file = rel_path("previews", i, &name, "png");
+                        codec::write_png(&out.join(&file), &cropped).ok()?;
+                        if let Ok(bytes) = fs::read(out.join(&file)) {
+                            edit_hash = Some(hash_bytes(&bytes));
+                        }
+                        Some(file)
+                    });
                 }
-                Some(file)
-            });
-            if preview.is_some() {
-                stats.link_previews_ok += 1;
+                if preview.is_some() {
+                    stats.link_previews_ok += 1;
+                }
             }
             stats.links += 1;
             Content::Link {
@@ -820,22 +851,25 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
                         // WBGR has a re-encoder, so its preview is editable; GA16 does not.
                         let editable = pixel_fmt == crate::widegamut::WBGR;
                         let mut edit_hash = None;
-                        let preview = celm
-                            .raw
-                            .as_ref()
-                            .and_then(|raw_bytes| {
-                                raw_to_rgba_any(raw_bytes, width, height, bpr, pixel_fmt)
-                            })
-                            .and_then(|px| {
-                                let pfile = rel_path("previews", i, &name, "png");
-                                codec::write_png(&out.join(&pfile), &px).ok()?;
-                                if editable {
-                                    if let Ok(bytes) = fs::read(out.join(&pfile)) {
-                                        edit_hash = Some(hash_bytes(&bytes));
+                        let preview = if skip_previews {
+                            None
+                        } else {
+                            celm.raw
+                                .as_ref()
+                                .and_then(|raw_bytes| {
+                                    raw_to_rgba_any(raw_bytes, width, height, bpr, pixel_fmt)
+                                })
+                                .and_then(|px| {
+                                    let pfile = rel_path("previews", i, &name, "png");
+                                    codec::write_png(&out.join(&pfile), &px).ok()?;
+                                    if editable {
+                                        if let Ok(bytes) = fs::read(out.join(&pfile)) {
+                                            edit_hash = Some(hash_bytes(&bytes));
+                                        }
                                     }
-                                }
-                                Some(pfile)
-                            });
+                                    Some(pfile)
+                                })
+                        };
                         if preview.is_some() {
                             stats.dmp2_previews_ok += 1;
                             stats.dmp2_total += 1;
@@ -854,7 +888,7 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
                         let kind = format!("celm-{}", compression::name(celm.compression));
                         let is_previewable = celm.compression == compression::DEEPMAP2
                             || celm.compression == compression::RLE;
-                        if is_previewable {
+                        if is_previewable && !skip_previews {
                             stats.dmp2_total += 1;
                             let editable =
                                 pixel_fmt == pixel_format::ARGB || pixel_fmt == pixel_format::GA8;
@@ -1067,7 +1101,6 @@ pub fn decompile(car: &Path, out: &Path, raw: bool) -> Result<()> {
             stats.dmp2_previews_ok, stats.dmp2_total
         );
     }
-
     Ok(())
 }
 
