@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use scar::codec::{self, Pixels};
 use scar::manifest::{Content, Manifest, Rendition};
-use scar::merge::{MergeOptions, merge_car, merge_car_report, merge_car_report_with};
+use scar::merge::{
+    MergeOptions, merge_car, merge_car_report, merge_car_report_with, replacement_sizes,
+};
 
 const SVG: &str = "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\" fill=\"#123456\"/></svg>";
 
@@ -192,6 +194,107 @@ fn decoded_data(dir: &std::path::Path, m: &Manifest, csi_name: &str) -> (Vec<u8>
         panic!("expected data rendition, got {:?}", r.content)
     };
     (std::fs::read(dir.join("work").join(file)).unwrap(), *lzfse)
+}
+
+#[test]
+fn replacement_sizes_reports_each_assets_bitmap_dimensions() {
+    let car = sample_car();
+    let names = ["logo".to_string(), "other".to_string(), "nope".to_string()];
+    let sizes = replacement_sizes(&car, &names).unwrap();
+
+    assert_eq!(sizes.get("logo").map(Vec::as_slice), Some(&[(24, 24)][..]));
+    assert_eq!(sizes.get("other").map(Vec::as_slice), Some(&[(8, 8)][..]));
+    assert_eq!(sizes.get("nope"), None, "unknown names must be absent");
+}
+
+/// A data rendition has no pixels, so it must not be offered a size.
+#[test]
+fn replacement_sizes_skips_vector_assets() {
+    let car = car_with_data("glyph.svg", SVG.as_bytes(), false);
+    let sizes = replacement_sizes(&car, &["glyph".to_string()]).unwrap();
+    assert_eq!(sizes.get("glyph"), None);
+}
+
+/// Renditions for `name` that `install_image` would accept a correctly-sized
+/// PNG for: decoded bitmaps, and payloads or atlas crops with editable previews.
+fn installable(m: &Manifest, name: &str) -> usize {
+    let ident = m
+        .facets
+        .iter()
+        .find(|f| f.name == name)
+        .and_then(|f| f.attributes.get("identifier"));
+    m.renditions
+        .iter()
+        .filter(|r| match ident {
+            Some(i) => r.key.get("identifier") == Some(i),
+            None => r.name == name || r.name.rsplit_once('.').map(|(s, _)| s) == Some(name),
+        })
+        .filter(|r| {
+            matches!(
+                &r.content,
+                Content::Image { .. }
+                    | Content::RawPayload {
+                        preview: Some(_),
+                        edit_hash: Some(_),
+                        ..
+                    }
+                    | Content::Link {
+                        preview: Some(_),
+                        edit_hash: Some(_),
+                        ..
+                    }
+            )
+        })
+        .count()
+}
+
+/// Offering a PNG at every reported size must reach every rendition that can
+/// take one, so sizing is never what stands between a replacement and the car.
+#[test]
+fn every_size_a_rendition_can_take_is_reported() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/re_catalogs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no tests/re_catalogs, skipping");
+        return;
+    };
+    let mut checked = 0;
+    for entry in entries {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        let car = std::fs::read(entry.path()).unwrap();
+        let (_tmp, m) = decompiled(&car);
+        let names: Vec<String> = m.facets.iter().map(|f| f.name.clone()).collect();
+        let sizes = replacement_sizes(&car, &names).unwrap();
+
+        // The asset with the most sizes exercises the multi-size path hardest.
+        let Some((name, wh)) = sizes
+            .iter()
+            .filter(|(n, _)| installable(&m, n) > 0)
+            .max_by_key(|(_, v)| v.len())
+        else {
+            continue;
+        };
+        let repl: Vec<(String, Vec<u8>)> = wh
+            .iter()
+            .map(|(w, h)| (name.clone(), png_bytes(&solid(*w, *h, [90, 160, 220, 255]))))
+            .collect();
+        let (_, report) = merge_car_report(&car, &repl).unwrap();
+        assert_eq!(
+            report.replaced,
+            installable(&m, name),
+            "every installable rendition of {name:?} in {:?} must be covered by \
+             the {} reported size(s)",
+            entry.path(),
+            wh.len()
+        );
+        checked += 1;
+        if checked == 3 {
+            break;
+        }
+    }
+    assert!(checked > 0, "no catalog exercised the sizing path");
 }
 
 #[test]

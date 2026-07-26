@@ -14,9 +14,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::authoring::{InstallOutcome, LinkPolicy, install_image, sanitize_name};
+use crate::bom::Bom;
+use crate::csi::Csi;
 use crate::manifest::{Composition, Content, Facet, Manifest, Rendition};
 use crate::{codec, compile, decompile, format};
 
@@ -79,6 +81,99 @@ impl Vector {
     /// Shipping catalogs wrap SVG payloads in LZFSE and store PDFs raw.
     fn lzfse(self) -> bool {
         self == Self::Svg
+    }
+}
+
+/// The distinct pixel sizes a PNG replacement for each of `names` must be
+/// offered at to reach every bitmap rendition behind it — links report their
+/// crop rect, everything else its own dimensions. Names with no bitmap
+/// rendition are absent from the map.
+///
+/// Sizing is necessary but not sufficient: whether a correctly-sized PNG
+/// actually installs also depends on the payload being re-encodable, which only
+/// [`merge_car_report`] can tell you. Offering a size that turns out to be
+/// un-installable is harmless — it lands nowhere, exactly as an unsized
+/// replacement would.
+///
+/// Reads CSI headers only (no payload decoding), so it is cheap enough to call
+/// before deciding what to render.
+pub fn replacement_sizes(
+    car: &[u8],
+    names: &[String],
+) -> Result<BTreeMap<String, Vec<(u32, u32)>>> {
+    let bom = Bom::parse(car).context("parsing BOM container")?;
+    let key_ids = decompile::parse_keyformat(
+        bom.var_block("KEYFORMAT")
+            .context("missing KEYFORMAT var")?,
+    )?;
+    let renditions = bom
+        .tree_entries("RENDITIONS")
+        .context("walking RENDITIONS tree")?;
+
+    // identifier -> facet name, so a rendition can be traced back to its asset.
+    let mut by_identifier: BTreeMap<u16, String> = BTreeMap::new();
+    for (key, value) in bom.tree_entries("FACETKEYS").unwrap_or_default() {
+        let name = String::from_utf8_lossy(&key).into_owned();
+        let Ok(facet) = decompile::parse_facet_value(&name, &value) else {
+            continue;
+        };
+        if let Some(ident) = facet.attributes.get("identifier") {
+            by_identifier.insert(*ident, facet.name);
+        }
+    }
+
+    let wanted: BTreeMap<&str, ()> = names.iter().map(|n| (n.as_str(), ())).collect();
+    let mut parsed = Vec::with_capacity(renditions.len());
+    for (key_bytes, value) in &renditions {
+        let csi = Csi::parse(value).context("parsing CSI blob")?;
+        let values = decompile::decode_key_vec(key_bytes, key_ids.len()).unwrap_or_default();
+        let ident = decompile::key_vec_to_map(&key_ids, &values)
+            .get("identifier")
+            .copied();
+        parsed.push((csi, ident));
+    }
+
+    // resolve_renditions prefers a facet's identifier and only falls back to CSI
+    // names when that yields nothing, so resolve by facet across the whole
+    // catalogue first.
+    let mut out: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+    for (csi, ident) in &parsed {
+        let Some(name) = ident
+            .and_then(|i| by_identifier.get(&i))
+            .filter(|n| wanted.contains_key(n.as_str()))
+        else {
+            continue;
+        };
+        push_size(&mut out, name, csi);
+    }
+    for (csi, _) in &parsed {
+        let csi_name = csi.header.name_str();
+        let stem = csi_name
+            .rsplit_once('.')
+            .map_or(csi_name.as_str(), |(s, _)| s);
+        for candidate in [csi_name.as_str(), stem] {
+            if wanted.contains_key(candidate) && !out.contains_key(candidate) {
+                push_size(&mut out, candidate, csi);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Record the size a PNG must have to replace `csi`, if it is a bitmap at all.
+fn push_size(out: &mut BTreeMap<String, Vec<(u32, u32)>>, name: &str, csi: &Csi) {
+    // A link's replacement must match its crop, not the atlas it points into.
+    let size = match csi.tlv(format::tlv::INTERNAL_LINK) {
+        Some(t) => codec::inlk_decode(t).ok().map(|l| (l.width, l.height)),
+        None if csi.header.layout == format::layout::MULTISIZE_SET => None,
+        None => Some((csi.header.width, csi.header.height)),
+    };
+    let Some(size) = size.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return;
+    };
+    let sizes = out.entry(name.to_string()).or_default();
+    if !sizes.contains(&size) {
+        sizes.push(size);
     }
 }
 

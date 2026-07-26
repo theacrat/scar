@@ -108,7 +108,7 @@ fn parse_extended_metadata(data: &[u8]) -> Result<ExtendedMetadata> {
 }
 
 /// Attribute ids, in on-disk KEYFORMAT order.
-fn parse_keyformat(data: &[u8]) -> Result<Vec<u32>> {
+pub(crate) fn parse_keyformat(data: &[u8]) -> Result<Vec<u32>> {
     if data.len() < 12 {
         bail!("KEYFORMAT block too short: {} bytes", data.len());
     }
@@ -126,7 +126,7 @@ fn parse_keyformat(data: &[u8]) -> Result<Vec<u32>> {
 }
 
 /// Decode a tree key (numTokens * u16 LE) into values in keyformat order.
-fn decode_key_vec(key_bytes: &[u8], num_tokens: usize) -> Result<Vec<u16>> {
+pub(crate) fn decode_key_vec(key_bytes: &[u8], num_tokens: usize) -> Result<Vec<u16>> {
     if key_bytes.len() != num_tokens * 2 {
         bail!(
             "rendition key length {} != {} tokens * 2",
@@ -142,7 +142,7 @@ fn decode_key_vec(key_bytes: &[u8], num_tokens: usize) -> Result<Vec<u16>> {
 }
 
 /// Key vector -> attribute-name map, omitting zero-valued attributes.
-fn key_vec_to_map(key_ids: &[u32], values: &[u16]) -> BTreeMap<String, u16> {
+pub(crate) fn key_vec_to_map(key_ids: &[u32], values: &[u16]) -> BTreeMap<String, u16> {
     let mut m = BTreeMap::new();
     for (id, val) in key_ids.iter().zip(values.iter()) {
         if *val != 0 {
@@ -152,13 +152,13 @@ fn key_vec_to_map(key_ids: &[u32], values: &[u16]) -> BTreeMap<String, u16> {
     m
 }
 
-struct FacetRaw {
-    name: String,
-    hotspot: (u16, u16),
-    attributes: BTreeMap<String, u16>,
+pub(crate) struct FacetRaw {
+    pub(crate) name: String,
+    pub(crate) hotspot: (u16, u16),
+    pub(crate) attributes: BTreeMap<String, u16>,
 }
 
-fn parse_facet_value(name: &str, value: &[u8]) -> Result<FacetRaw> {
+pub(crate) fn parse_facet_value(name: &str, value: &[u8]) -> Result<FacetRaw> {
     if value.len() < 6 {
         bail!(
             "facet {name}: renditionkeytoken too short ({} bytes)",
